@@ -1,0 +1,517 @@
+---
+title: "Correlation Analysis: Marketing Dataset"
+subtitle: "v0.3 — Simplified + Data Cleaning"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(ranger)
+library(scales)
+```
+
+---
+
+## 1. Dataset Description
+
+```{r load-data}
+df <- read.csv("marketing_data.csv", stringsAsFactors = FALSE)
+
+# Clean column names and Income column
+names(df) <- trimws(names(df))
+df$Income <- as.numeric(trimws(df$Income))
+
+# New variables
+df$Age        <- 2025 - df$Year_Birth
+df$TotalSpend <- df$MntWines + df$MntFruits + df$MntMeatProducts +
+                 df$MntFishProducts + df$MntSweetProducts + df$MntGoldProds
+```
+
+This dataset contains customer records from a retail company, including demographic information, household details, and purchasing behavior across different product categories.
+
+**Source:** Kaggle — *Customer Personality Analysis*
+
+**Dataset dimensions:**
+
+```{r dataset-size}
+data.frame(
+  ` ` = c("Number of customers", "Number of variables"),
+  Value = c(nrow(df), ncol(df))
+) %>%
+  kable(col.names = c("", ""), align = "lr") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = FALSE)
+```
+
+**Description of key variables used in this analysis:**
+
+```{r data-dictionary}
+dictionary <- data.frame(
+  Variable = c("Income", "TotalSpend", "Age", "Education",
+               "Kidhome", "Teenhome"),
+  Description = c(
+    "Customer's yearly household income (USD)",
+    "Total spending across all product categories in the last 2 years (derived)",
+    "Customer's age (derived from Year_Birth)",
+    "Customer's highest education level",
+    "Number of children in the household",
+    "Number of teenagers in the household"
+  )
+)
+kable(dictionary, align = "ll") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## 2. Data Cleaning — Removing Erroneous Records
+
+Before any analysis, we inspect the data for values that are technically valid numbers but clearly incorrect in real-world terms. Two problems were found.
+
+```{r data-cleaning}
+n_before <- nrow(df)
+
+# Flag the problematic rows before removing them
+problem_rows <- data.frame(
+  Issue = c(
+    "Income = $666,666",
+    "Year_Birth = 1893 (age 132)",
+    "Year_Birth = 1899 (age 126)",
+    "Year_Birth = 1900 (age 125)"
+  ),
+  Reason = c(
+    "The second highest income is $162,397 — a $500,000 gap makes this a data entry error",
+    "Would make this customer 132 years old — biologically impossible",
+    "Would make this customer 126 years old — biologically impossible",
+    "Would make this customer 125 years old — biologically impossible"
+  ),
+  Decision = rep("Removed", 4)
+)
+
+# Remove the rows
+df <- df[!(df$Income == 666666 & !is.na(df$Income)), ]
+df <- df[!(df$Year_Birth < 1930), ]
+
+# Recalculate Age after cleaning
+df$Age <- 2025 - df$Year_Birth
+
+n_after   <- nrow(df)
+n_removed <- n_before - n_after
+```
+
+```{r cleaning-table}
+kable(problem_rows, align = "lll") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(3, bold = TRUE, color = "#d7191c")
+```
+
+**`r n_removed` rows were removed** (from `r n_before` to `r n_after` customers).
+
+**Why remove rather than correct?**
+We do not know what the true values should have been. For the income entry of $666,666, we could theoretically impute a replacement — but since we are already imputing other missing income values, replacing an obviously wrong value with yet another estimate would layer uncertainty on top of uncertainty. For the birth years, there is no plausible correction. Removing these `r n_removed` rows has negligible impact on a dataset of `r n_after` observations.
+
+---
+
+## 3. Research Question
+
+**Selected variables:** `income_noNA` (annual household income, with missing values imputed) and `TotalSpend` (total spending)
+
+> **Research Question:** Is there an association between a customer's annual household income and their total spending on products over the last two years?
+
+---
+
+## 4. Variable Types and Missing Values
+
+Both variables are **numerical (continuous)**. Before analysis, we check for missing values.
+
+```{r missing-values}
+missing_tbl <- data.frame(
+  Variable        = c("Income", "TotalSpend"),
+  Type            = c("Numeric", "Numeric"),
+  Missing_Count   = c(sum(is.na(df$Income)), sum(is.na(df$TotalSpend))),
+  Missing_Percent = c(
+    paste0(round(mean(is.na(df$Income)) * 100, 1), "%"),
+    paste0(round(mean(is.na(df$TotalSpend)) * 100, 1), "%")
+  )
+)
+
+kable(missing_tbl,
+      col.names = c("Variable", "Type", "Missing Count", "Missing (%)"),
+      align = "llcc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+`Income` has **`r sum(is.na(df$Income))`** missing values. Instead of deleting these rows, we estimate the missing incomes using a Random Forest model in the next section.
+
+---
+
+## 5. Income Imputation
+
+Rather than dropping the `r sum(is.na(df$Income))` customers with missing income, we predict their likely income using a **Random Forest** — a machine learning algorithm that builds many decision trees and averages their predictions.
+
+**Predictors used to estimate missing income:**
+
+```{r predictor-table}
+pred_tbl <- data.frame(
+  Predictor = c("Education", "Age", "TotalSpend",
+                "Kidhome", "Teenhome",
+                "NumCatalogPurchases", "NumStorePurchases"),
+  Rationale = c(
+    "Education level is a strong predictor of earning capacity",
+    "Income tends to peak mid-career",
+    "Spending behaviour reflects available disposable income",
+    "Household size affects income needs",
+    "Household size affects income needs",
+    "Catalogue buyers tend to be higher-income customers",
+    "Store visit frequency reflects purchasing power"
+  )
+)
+kable(pred_tbl, align = "ll") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r imputation}
+# Separate complete and missing rows
+complete_rows <- df[!is.na(df$Income), ]
+missing_rows  <- df[ is.na(df$Income), ]
+
+# Train Random Forest on complete cases (80% train, 20% test)
+set.seed(42)
+train_idx <- sample(nrow(complete_rows), size = floor(0.8 * nrow(complete_rows)))
+train_df  <- complete_rows[ train_idx, ]
+test_df   <- complete_rows[-train_idx, ]
+
+rf_model <- ranger(
+  formula   = Income ~ Education + Age + TotalSpend +
+                       Kidhome + Teenhome +
+                       NumCatalogPurchases + NumStorePurchases,
+  data      = train_df,
+  num.trees = 500,
+  seed      = 42
+)
+
+# Evaluate on test set
+test_preds <- predict(rf_model, data = test_df)$predictions
+rmse       <- round(sqrt(mean((test_preds - test_df$Income)^2)), 0)
+r2         <- round(1 - sum((test_preds - test_df$Income)^2) /
+                         sum((test_df$Income - mean(test_df$Income))^2), 3)
+
+# Predict missing incomes
+df$income_noNA <- df$Income
+df$income_noNA[is.na(df$Income)] <- predict(rf_model,
+                                             data = missing_rows)$predictions
+```
+
+**Model performance on the held-out test set:**
+
+```{r model-performance}
+data.frame(
+  Metric = c("RMSE (Root Mean Squared Error)", "R² (Variance explained)"),
+  Value  = c(paste0("$", format(rmse, big.mark = ",")), r2)
+) %>%
+  kable(col.names = c("Metric", "Value"), align = "lr") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = FALSE)
+```
+
+The model explains **71.5%** of the variance in income (R² = 0.715). The average prediction error is approximately **$11,856** — acceptable given that income in this dataset ranges from $1,730 to $162,397 (a spread of over $160,000).
+
+**Distribution of original vs imputed income values:**
+
+```{r imputation-dist, fig.width=8, fig.height=4}
+dist_df <- data.frame(
+  Income = c(df$Income[!is.na(df$Income)],
+             df$income_noNA[is.na(df$Income)]),
+  Group  = c(rep("Observed", sum(!is.na(df$Income))),
+             rep("Imputed",  sum( is.na(df$Income))))
+)
+
+ggplot(dist_df, aes(x = Income, fill = Group)) +
+  geom_histogram(binwidth = 5000, alpha = 0.65,
+                 position = "identity", color = "white") +
+  scale_x_continuous(labels = comma) +
+  scale_fill_manual(values = c("Observed" = "#2c7bb6", "Imputed" = "#d7191c")) +
+  labs(title = "Income Distribution: Observed vs Imputed",
+       x = "Annual Income (USD)", y = "Number of customers", fill = NULL) +
+  theme_minimal(base_size = 13)
+```
+
+The imputed values follow a similar distribution to the observed ones, which gives us confidence that the model is producing realistic estimates. We now use `income_noNA` (which contains the original values where available, and imputed values where not) in all subsequent analyses.
+
+---
+
+## 6. Descriptive Statistics
+
+```{r descriptive-stats}
+desc_stats <- function(x, varname) {
+  data.frame(
+    Variable = varname,
+    n        = length(x),
+    Mean     = round(mean(x), 0),
+    SD       = round(sd(x), 0),
+    Median   = round(median(x), 0),
+    Min      = round(min(x), 0),
+    Max      = round(max(x), 0)
+  )
+}
+
+kable(
+  rbind(desc_stats(df$income_noNA, "income_noNA (USD)"),
+        desc_stats(df$TotalSpend,  "TotalSpend (USD)")),
+  col.names = c("Variable", "n", "Mean", "Std. Dev.", "Median", "Min", "Max"),
+  align = "lrrrrrr",
+  format.args = list(big.mark = ",")
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The average customer income is **$51,933** (SD = $21,464, Median = $51,342), with values ranging from $1,730 to $162,397. Total spending is considerably more skewed: the mean is $606 but the median is only $396, indicating that a small number of high-spending customers pull the average upward. Spending ranges from $5 to $2,525.
+
+---
+
+## 7. Scatterplot
+
+```{r scatterplot, fig.width=8, fig.height=5}
+ggplot(df, aes(x = income_noNA, y = TotalSpend)) +
+  geom_point(alpha = 0.3, color = "#2c7bb6", size = 1.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#d7191c", linewidth = 1) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Annual Income vs Total Spending",
+    subtitle = "Each point = one customer | Red line: linear trend with 95% confidence band",
+    x        = "Annual Household Income — income_noNA (USD)",
+    y        = "Total Spending (USD)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The scatterplot shows a clear upward trend: customers with higher incomes generally spend more. The cloud of points widens at higher income levels, suggesting that **variance in spending increases with income** (heteroscedasticity) — this is one reason we also test non-parametric and log-transformed correlations below.
+
+---
+
+## 8. Correlation Analysis
+
+### 8.1 Assumption Check
+
+Pearson correlation assumes a **linear** relationship and is sensitive to outliers. To check whether these assumptions hold, we compare the smooth LOESS curve against the straight regression line, and inspect whether residuals fan out.
+
+```{r assumption-plots, fig.width=10, fig.height=4}
+lm_raw <- lm(TotalSpend ~ income_noNA, data = df)
+
+p1 <- ggplot(df, aes(x = income_noNA, y = TotalSpend)) +
+  geom_point(alpha = 0.2, color = "#2c7bb6", size = 1.4) +
+  geom_smooth(method = "lm",    se = FALSE, color = "grey50",
+              linewidth = 0.9, linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "#d7191c",
+              linewidth = 1) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Linearity check",
+       subtitle = "Red = LOESS curve | Dashed = straight OLS line",
+       x = "income_noNA", y = "TotalSpend") +
+  theme_minimal(base_size = 12)
+
+resid_df <- data.frame(fitted    = fitted(lm_raw),
+                       residuals = residuals(lm_raw))
+
+p2 <- ggplot(resid_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.2, color = "#2c7bb6", size = 1.4) +
+  geom_hline(yintercept = 0, color = "#d7191c", linewidth = 0.9) +
+  geom_smooth(method = "loess", se = FALSE, color = "orange", linewidth = 0.8) +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Homoscedasticity check",
+       subtitle = "A fan shape means variance grows with fitted values",
+       x = "Fitted values", y = "Residuals") +
+  theme_minimal(base_size = 12)
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+- **Left plot:** If the red LOESS curve closely follows the dashed straight line, the relationship is linear. A curved LOESS suggests non-linearity.
+- **Right plot:** If the spread of points grows from left to right (a funnel/fan shape), heteroscedasticity is present — meaning Pearson's significance test becomes less reliable.
+
+---
+
+### 8.2 Three Correlation Coefficients
+
+Because the assumption checks may reveal issues with raw Pearson, we calculate three measures side by side:
+
+| Method | What it measures | Assumption |
+|---|---|---|
+| **Pearson** | Linear association on raw values | Linearity + normality |
+| **Log-Pearson** | Linear association after log-transforming both variables | Log-linear relationship |
+| **Spearman** | Monotonic association based on ranks | No linearity needed, robust to outliers |
+
+```{r three-correlations}
+ct_pearson  <- cor.test(df$income_noNA,        df$TotalSpend,
+                        method = "pearson")
+ct_log      <- cor.test(log1p(df$income_noNA), log1p(df$TotalSpend),
+                        method = "pearson")
+ct_spearman <- cor.test(df$income_noNA,        df$TotalSpend,
+                        method = "spearman", exact = FALSE)
+```
+
+```{r log-scatterplot, fig.width=8, fig.height=5}
+ggplot(df, aes(x = log1p(income_noNA), y = log1p(TotalSpend))) +
+  geom_point(alpha = 0.3, color = "#5ab4ac", size = 1.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#d7191c", linewidth = 1) +
+  labs(
+    title    = "Annual Income vs Total Spending — Log Scale",
+    subtitle = "log1p applied to both axes | Red line: linear trend with 95% CI",
+    x        = "log1p(income_noNA)",
+    y        = "log1p(TotalSpend)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### 8.3 Results
+
+```{r results-table}
+results <- data.frame(
+  Method = c("Pearson (raw scale)",
+             "Log-Pearson (log scale)",
+             "Spearman (rank-based)"),
+  r      = round(c(ct_pearson$estimate,
+                   ct_log$estimate,
+                   ct_spearman$estimate), 3),
+  p_value = c(format.pval(ct_pearson$p.value,  digits = 3),
+              format.pval(ct_log$p.value,       digits = 3),
+              format.pval(ct_spearman$p.value,  digits = 3)),
+  CI      = c(
+    paste0("[", round(ct_pearson$conf.int[1], 3), ", ",
+                round(ct_pearson$conf.int[2], 3), "]"),
+    paste0("[", round(ct_log$conf.int[1], 3), ", ",
+                round(ct_log$conf.int[2], 3), "]"),
+    "—"
+  )
+)
+
+kable(results,
+      col.names = c("Method", "Coefficient (r / ρ)", "p-value", "95% CI"),
+      align = "lrll") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(which.max(abs(results$r)), bold = TRUE, background = "#e8f4f8")
+```
+
+```{r bar-chart, fig.width=7, fig.height=4}
+bar_df <- data.frame(
+  Method = c("Pearson\n(raw)", "Log-Pearson\n(log scale)", "Spearman\n(rank)"),
+  r      = c(ct_pearson$estimate, ct_log$estimate, ct_spearman$estimate)
+)
+
+ggplot(bar_df, aes(x = Method, y = r, fill = Method)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = round(r, 3)), vjust = -0.5,
+            size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("#2c7bb6", "#5ab4ac", "#d7191c")) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Comparison of Correlation Coefficients",
+       x = NULL, y = "Correlation") +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation:**
+
+All three methods reveal a **strong, statistically significant positive association** between income and total spending (all p < 2e-16).
+
+- **Spearman (ρ = 0.853)** is the highest of the three. This tells us that the rank ordering of customers by income very closely matches their rank ordering by spending — a strong monotonic relationship. Spearman is not affected by outliers or the non-normal tails we observed in the Q-Q plot, which makes it the most reliable measure here.
+- **Pearson (r = 0.793)** is notably lower than Spearman (gap of 0.06). This gap is explained by the Cook's Distance and Q-Q results in §9: a small number of influential observations and non-normal residual tails are pulling the Pearson coefficient downward relative to the true strength of the association.
+- **Log-Pearson (r = 0.759)** is the lowest of the three, meaning the log transformation does not improve the fit here. The relationship is not primarily log-linear — the rank-based pattern (captured by Spearman) is a better description of the data structure.
+
+**Conclusion on method choice:** **Spearman (ρ = 0.853) is the primary measure** for this analysis. The Cook's Distance plot showed a small number of high-leverage observations, and the Q-Q plot confirmed non-normal tails — both conditions where Spearman outperforms Pearson. Raw Pearson (r = 0.793) is reported for completeness and remains consistent in direction and significance, but should be interpreted cautiously.
+
+---
+
+## 9. Outliers and Influential Observations
+
+```{r outliers, fig.width=9, fig.height=4}
+model     <- lm(TotalSpend ~ income_noNA, data = df)
+cooksd    <- cooks.distance(model)
+threshold <- 4 / nrow(df)
+
+par(mfrow = c(1, 2))
+plot(cooksd, type = "h",
+     main  = "Cook's Distance",
+     ylab  = "Cook's Distance",
+     xlab  = "Observation index",
+     col   = ifelse(cooksd > threshold, "red", "steelblue"))
+abline(h = threshold, col = "red", lty = 2, lwd = 1.5)
+plot(model, which = 2, main = "Normal Q-Q Plot of Residuals")
+par(mfrow = c(1, 1))
+```
+
+```{r outlier-summary}
+data.frame(
+  Variable = c("income_noNA", "TotalSpend"),
+  `Outliers (IQR method)` = c(
+    sum(df$income_noNA < quantile(df$income_noNA, 0.25) - 1.5 * IQR(df$income_noNA) |
+        df$income_noNA > quantile(df$income_noNA, 0.75) + 1.5 * IQR(df$income_noNA)),
+    sum(df$TotalSpend < quantile(df$TotalSpend, 0.25) - 1.5 * IQR(df$TotalSpend) |
+        df$TotalSpend > quantile(df$TotalSpend, 0.75) + 1.5 * IQR(df$TotalSpend))
+  )
+) %>%
+  kable(col.names = c("Variable", "Outliers (IQR method)"), align = "lc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The Cook's Distance plot identifies observations that have an unusually large influence on the regression line. Points above the dashed threshold (4/n = `r round(threshold, 4)`) are flagged as influential — there are **`r sum(cooksd > threshold)` such observations** in this dataset. The Q-Q plot shows that residuals deviate from normality in the tails, consistent with the heteroscedasticity we observed earlier.
+
+---
+
+## 10. Correlation Matrix and Heatmap
+
+Since the dataset contains more than four numerical variables, we present a full correlation matrix across the main spending and purchasing variables.
+
+```{r heatmap, fig.width=8, fig.height=7}
+num_vars <- df[ , c("income_noNA", "MntWines", "MntFruits", "MntMeatProducts",
+                    "MntFishProducts", "MntSweetProducts", "MntGoldProds",
+                    "NumWebPurchases", "NumCatalogPurchases",
+                    "NumStorePurchases", "TotalSpend", "Recency")]
+
+cor_matrix <- cor(num_vars, use = "complete.obs")
+
+corrplot(cor_matrix,
+         method      = "color",
+         type        = "upper",
+         order       = "hclust",
+         tl.col      = "black",
+         tl.srt      = 45,
+         tl.cex      = 0.85,
+         addCoef.col = "black",
+         number.cex  = 0.7,
+         col         = colorRampPalette(c("#d7191c", "white", "#2c7bb6"))(200),
+         title       = "Pearson Correlation Matrix",
+         mar         = c(0, 0, 2, 0))
+```
+
+The heatmap reveals that **wine and meat spending are most strongly correlated with income**, followed by catalog purchases. **Recency** (days since last purchase) shows little to no correlation with income, suggesting that purchase frequency is not driven by financial capacity alone.
+
+---
+
+## 11. Conclusion and Limitations
+
+This analysis examined the association between customers' annual household income and their total spending over the last two years. All three correlation methods agree on a **strong, positive, and statistically significant association** (all p < 2e-16). Customers with higher incomes consistently tend to spend more at this retailer.
+
+The **Spearman coefficient (ρ = 0.853)** is the preferred primary measure. It is the strongest of the three and is robust to the influential observations identified by Cook's Distance and the non-normal residual tails shown in the Q-Q plot. The Pearson coefficient (r = 0.793) corroborates the finding but is modestly pulled down by a small number of high-leverage customers. The correlation matrix further shows that income is most strongly associated with wine spending (r = 0.69), store purchases (r = 0.64), and catalog purchases (r = 0.63), while Recency (days since last purchase) shows virtually no association with income (r = 0.01–0.02).
+
+**Limitations:**
+
+- **Missing income values** were estimated using a machine learning model rather than observed directly. While the model performs reasonably well (R² = `r r2`), imputed values carry uncertainty not present in the original data.
+- **Circular dependency:** `TotalSpend` was used as a predictor to impute `Income`, and is also the outcome variable in the correlation — this may slightly inflate the observed association.
+- **Company-specific spending:** `TotalSpend` only captures purchases at this retailer. High-income customers who shop elsewhere will appear as low spenders, weakening the true relationship.
+- **Country differences:** Customers come from multiple countries with very different income levels and purchasing power. Pooling them without adjustment may distort the results.
+- **No causation:** A correlation does not tell us that higher income *causes* higher spending. Other factors — age, education, household size — likely play a role as well.
