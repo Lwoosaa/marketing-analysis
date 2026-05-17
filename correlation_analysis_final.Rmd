@@ -468,7 +468,7 @@ data.frame(
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-The Cook's Distance plot identifies observations that have an unusually large influence on the regression line. Points above the dashed threshold (4/n = `r round(threshold, 4)`) are flagged as influential — there are **`r sum(cooksd > threshold)` such observations** in this dataset. The Q-Q plot shows that residuals deviate from normality in the tails, consistent with the heteroscedasticity we observed earlier.
+The Cook's Distance plot identifies observations that have an unusually large influence on the regression line. Points above the dashed threshold (4/n = `r round(threshold, 4)`) are flagged as influential — there are **`r sum(cooksd > threshold)` such observations** (`r round(sum(cooksd > threshold)/nrow(df)*100, 1)`% of the dataset). Note that while the graph visually shows only a few tall bars, the threshold value is very small (≈0.0018), so many bars that appear flat also exceed it mathematically. Combined with the non-normal tails in the Q-Q plot, this confirms that **Spearman is the appropriate primary measure** over Pearson.
 
 ---
 

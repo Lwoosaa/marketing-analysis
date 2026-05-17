@@ -3630,9 +3630,12 @@ TotalSpend
 <p>The Cook’s Distance plot identifies observations that have an
 unusually large influence on the regression line. Points above the
 dashed threshold (4/n = 0.0018) are flagged as influential — there are
-<strong>122 such observations</strong> in this dataset. The Q-Q plot
-shows that residuals deviate from normality in the tails, consistent
-with the heteroscedasticity we observed earlier.</p>
+<strong>122 such observations</strong> (5.5% of the dataset). Note that
+while the graph visually shows only a few tall bars, the threshold value
+is very small (≈0.0018), so many bars that appear flat also exceed it
+mathematically. Combined with the non-normal tails in the Q-Q plot, this
+confirms that <strong>Spearman is the appropriate primary
+measure</strong> over Pearson.</p>
 <hr />
 </div>
 <div id="correlation-matrix-and-heatmap" class="section level2">
